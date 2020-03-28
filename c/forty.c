@@ -15,6 +15,9 @@
 #define ERROR_LOAD_AMOUNT_HASH    44
 #define ERROR_LOAD_PROOF          45
 
+mol_seg_t current_script[SCRIPT_SIZE];
+mol_seg_t current_script_hash[HASH_SIZE];
+
 int pvm_hex2bin(char *s, unsigned char *buf)
 {
     int i,n = 0;
@@ -101,15 +104,14 @@ int bin2hex(uint8_t *bin, uint8_t len, unsigned char* out)
 // Load the current script.
 mol_seg_res_t load_current_script() {
   mol_seg_res_t script_seg_res;
-  unsigned char script[SCRIPT_SIZE];
   uint64_t len = SCRIPT_SIZE;
-  int ret = ckb_load_script(script, &len, 0);
+  int ret = ckb_load_script(current_script, &len, 0);
   if (ret != CKB_SUCCESS) {
     script_seg_res.errno = ret;
   } else if (len > SCRIPT_SIZE) {
     script_seg_res.errno = ERROR_SCRIPT_TOO_LONG;
   } else {
-    script_seg_res.seg.ptr = (uint8_t *)script;
+    script_seg_res.seg.ptr = (uint8_t *)current_script;
     script_seg_res.seg.size = len;
 
     if (MolReader_Script_verify(&script_seg_res.seg, false) != MOL_OK) {
@@ -124,28 +126,23 @@ mol_seg_res_t load_current_script() {
 // Load the script-hash of the current script
 mol_seg_res_t load_current_script_hash() {
   mol_seg_res_t script_hash_seg_res;
-  mol_seg_t script_hash[HASH_SIZE];
   uint64_t len = HASH_SIZE;
-  int ret = ckb_load_script_hash(script_hash, &len, 0);
+  int ret = ckb_load_script_hash(current_script_hash, &len, 0);
   if (ret != CKB_SUCCESS) {
     script_hash_seg_res.errno = ret;
   } else if (len != HASH_SIZE) {
     script_hash_seg_res.errno = ERROR_SYSCALL;
   } else {
     script_hash_seg_res.errno = MOL_OK;
-    script_hash_seg_res.seg.ptr = (uint8_t *)script_hash;
+    script_hash_seg_res.seg.ptr = (uint8_t *)current_script_hash;
     script_hash_seg_res.seg.size = len;
   }
   return script_hash_seg_res;
 }
 
 // Load the amount_hash from OutputData corresponding to the `index` and `source`
-mol_seg_res_t load_amount_hash(size_t index, size_t source) {
-  unsigned char hex[HASH_SIZE * 3];
-  char debug[800];
-
+mol_seg_res_t load_amount_hash(unsigned char *output_data, size_t index, size_t source) {
   mol_seg_res_t output_data_seg_res;
-  mol_seg_t output_data[DATA_SIZE];
   uint64_t len = DATA_SIZE;
   int ret = ckb_load_cell_data(
     (unsigned char *)output_data, &len, 0, index, source
@@ -161,7 +158,6 @@ mol_seg_res_t load_amount_hash(size_t index, size_t source) {
   }
 
   if (MolReader_BytesVec_verify(&output_data_seg_res.seg, false) != MOL_OK) {
-    ckb_debug("failed to MolReader_BytesVec_verify");
     output_data_seg_res.errno = ERROR_ENCODING;
     return output_data_seg_res;
   }
@@ -171,17 +167,12 @@ mol_seg_res_t load_amount_hash(size_t index, size_t source) {
   mol_seg_t bytes_seg = MolReader_Bytes_raw_bytes(&amount_hash_seg_res.seg);
   amount_hash_seg_res.seg = bytes_seg;
 
-  bin2hex(amount_hash_seg_res.seg.ptr, amount_hash_seg_res.seg.size, hex);
-  sprintf(debug, "......... load_amount_hash: %s, len: %ld", hex, len);
-  ckb_debug(debug);
-
   return amount_hash_seg_res;
 }
 
 // Load zk-proof from witness at index `index`
-mol_seg_res_t load_proof(size_t index) {
+mol_seg_res_t load_proof(unsigned char * witness, size_t index) {
   mol_seg_res_t proof_seg_res;
-  unsigned char witness[WITNESS_SIZE];
   uint64_t len = WITNESS_SIZE; // TODO Why not `0`?
   // TODO What the difference between CKB_SOURCE_INPUT and CKB_SOURCE_GROUP_INPUT
   // int ret = ckb_load_witness(witness, &len, 0, index, CKB_SOURCE_INPUT);
@@ -195,18 +186,19 @@ mol_seg_res_t load_proof(size_t index) {
   witness_seg.ptr = (uint8_t *)witness;
   witness_seg.size = len;
 
-  int ret2 = MolReader_WitnessArgs_verify(&witness_seg, false);
-  if (ret2 != MOL_OK) {
-  // if (MolReader_WitnessArgs_verify(&witness_seg, false) != MOL_OK) {
-    char debug[100];
-    sprintf(debug, "............ len=%ld, ret2=%d", len, ret2);
-    ckb_debug(debug);
+  if (MolReader_WitnessArgs_verify(&witness_seg, false) != MOL_OK) {
     proof_seg_res.errno = ERROR_LOAD_PROOF;
     return proof_seg_res;
   }
-  mol_seg_t output_type_seg = MolReader_WitnessArgs_get_output_type(&witness_seg);
-  mol_seg_t bytes_seg = MolReader_Bytes_raw_bytes(&output_type_seg);
 
+  // To raw bytes
+  mol_seg_t output_type_seg = MolReader_WitnessArgs_get_output_type(&witness_seg);
+  if (MolReader_BytesOpt_verify(&output_type_seg, false) != MOL_OK) {
+    proof_seg_res.errno = ERROR_LOAD_PROOF;
+    return proof_seg_res;
+  }
+
+  mol_seg_t bytes_seg = MolReader_Bytes_raw_bytes(&output_type_seg);
   proof_seg_res.errno = MOL_OK;
   proof_seg_res.seg = bytes_seg;
   return proof_seg_res;
@@ -214,15 +206,15 @@ mol_seg_res_t load_proof(size_t index) {
 
 // Verify zk-proof via syscall
 int ft_verify(
-    mol_seg_t input_amount_hash_seg,
-    mol_seg_t output_amount_hash_seg,
+    unsigned char * input_amount_hash,
+    unsigned char * output_amount_hash,
     mol_seg_t proof_seg
 ) {
   return syscall(
     42,
-    &input_amount_hash_seg.ptr,
-    &output_amount_hash_seg.ptr,
-    &proof_seg.ptr,
+    input_amount_hash,
+    output_amount_hash,
+    proof_seg.ptr,
     proof_seg.size,
     0, 0
   );
@@ -247,7 +239,7 @@ int ft_verify2() {
 
 int main() {
   char debug[1000];
-  unsigned char hex1[1000];
+  unsigned char hex1[900];
 
   // Load current script
   mol_seg_res_t script_seg_res = load_current_script();
@@ -330,41 +322,38 @@ int main() {
     }
 
     // Rule2: FT-input.amount >= FT-output.amount (verified by syscall zk42)
-    ckb_debug("............ load_amount_hash(index, CKB_SOURCE_INPUT)");
-    mol_seg_res_t input_amount_hash_seg_res = load_amount_hash(index, CKB_SOURCE_INPUT);
+
+    unsigned char in_data[DATA_SIZE];
+    mol_seg_res_t input_amount_hash_seg_res = load_amount_hash(in_data, index, CKB_SOURCE_INPUT);
     if (input_amount_hash_seg_res.errno != MOL_OK) {
       return input_amount_hash_seg_res.errno;
     }
-
-    bin2hex(input_amount_hash_seg_res.seg.ptr, input_amount_hash_seg_res.seg.size, hex1);
-    // sprintf(debug, "......... input_amount_hash.size: %d, input_amount_hash: %s", input_amount_hash_seg_res.seg.size, hex1);
-    ckb_debug(debug);
-
-    ckb_debug("........... load_amount_hash(index, CKB_SOURCE_OUTPUT)");
-    mol_seg_res_t output_amount_hash_seg_res = load_amount_hash(index, CKB_SOURCE_INPUT);
+ 
+    unsigned char out_data[DATA_SIZE];
+    mol_seg_res_t output_amount_hash_seg_res = load_amount_hash(out_data, index, CKB_SOURCE_OUTPUT);
     if (output_amount_hash_seg_res.errno != MOL_OK) {
       return output_amount_hash_seg_res.errno;
     }
-
+ 
     ckb_debug("........... load_proof");
-    mol_seg_res_t proof_seg_res = load_proof(index);
+    unsigned char witness[WITNESS_SIZE];
+    mol_seg_res_t proof_seg_res = load_proof(witness, index);
     if (proof_seg_res.errno != MOL_OK) {
       return proof_seg_res.errno;
     }
-
+ 
     bin2hex(proof_seg_res.seg.ptr, proof_seg_res.seg.size, hex1);
-    // sprintf(debug, "......... proof.size: %d, proof: %s", proof_seg_res.seg.size, hex1);
+    sprintf(debug, "......... proof.size: %d, proof: %s --", proof_seg_res.seg.size, hex1);
     ckb_debug(debug);
-
+ 
     ckb_debug(".......... start ft_verify");
-     // ret = ft_verify(
-     //     input_amount_hash_seg_res.seg,
-     //     output_amount_hash_seg_res.seg,
-     //     proof_seg_res.seg
-     // );
+    ret = ft_verify(
+        input_amount_hash_seg_res.seg.ptr,
+        output_amount_hash_seg_res.seg.ptr,
+        proof_seg_res.seg
+    );
 
-
-    ret = ft_verify2();
+    // ret = ft_verify2();
 
     if (ret != CKB_SUCCESS) {
       return ret;
